@@ -275,7 +275,11 @@ class DockerRuntime(ExecutionEnvironment):
 
 
         self.ip = ip
-        self.docker_host = r"tcp://" + self.ip + r":2375"
+        self.docker_host = (
+            r"tcp://" + self.ip + r":2375"
+            if self.ip
+            else "unix:///var/run/docker.sock"
+        )
         custom_env = {
             'DOCKER_HOST': self.docker_host, 
             'DOCKER_TLS_VERIFY': DOCKER_TLS_VERIFY, 
@@ -286,7 +290,11 @@ class DockerRuntime(ExecutionEnvironment):
         print(f"connection to docker, use ip:{self.ip}, docker_host:{self.docker_host}")
         self.logger.info(f"connection to docker, use ip:{self.ip}, docker_host:{self.docker_host}")
         if self.backend == "docker":
-            self.client = docker.from_env(timeout=120,environment=custom_env)
+            self.client = (
+                docker.from_env(timeout=120, environment=custom_env)
+                if self.ip
+                else docker.DockerClient(base_url=self.docker_host, timeout=120)
+            )
         elif self.backend == "kubernetes":
             # Try in-cluster config first, fallback to kubeconfig
             try:
@@ -688,7 +696,7 @@ class DockerRuntime(ExecutionEnvironment):
             self.run(f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
             self.run('echo \'export PATH="/usr/local/bin:$PATH"\' >> ~/.bashrc')
             # self.run("pip install chardet")
-            self.run("pip install chardet --trusted-host pypi-mirror.weizhipin.com -i http://pypi-mirror.weizhipin.com/bzl-aliyun-pypi/simple")
+            self.run("pip install chardet -i https://pypi.tuna.tsinghua.edu.cn/simple")
             check_chardet_num_all = 3
             for check_chardet_num in range(check_chardet_num_all):
                 result_check_chardet = self.run(
@@ -739,7 +747,7 @@ class DockerRuntime(ExecutionEnvironment):
             self.run(f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
             self.run('echo \'export PATH="/usr/local/bin:$PATH"\' >> ~/.bashrc')
             # self.run("pip install chardet")
-            self.run("pip install chardet --trusted-host pypi-mirror.weizhipin.com -i http://pypi-mirror.weizhipin.com/bzl-aliyun-pypi/simple")
+            self.run("pip install chardet -i https://pypi.tuna.tsinghua.edu.cn/simple")
             check_chardet_num_all = 3
             for check_chardet_num in range(check_chardet_num_all):
                 result_check_chardet = self.run(
@@ -848,7 +856,7 @@ class DockerRuntime(ExecutionEnvironment):
             # self.run(
             #     "python -m pip install tree-sitter==0.20.4 tree_sitter_languages==1.10.2"
             # )
-            self.run("pip install chardet --trusted-host pypi-mirror.weizhipin.com -i http://pypi-mirror.weizhipin.com/bzl-aliyun-pypi/simple")
+            self.run("pip install chardet -i https://pypi.tuna.tsinghua.edu.cn/simple")
 
             check_chardet_num_all = 3
             for check_chardet_num in range(check_chardet_num_all):
@@ -1024,7 +1032,7 @@ class DockerRuntime(ExecutionEnvironment):
         if workdir:
             # Use '&&' so that failure to change directory aborts the command
             command += f"cd {workdir} && "
-        command += f"timeout {timeout} {code} {args}"
+        command += f"(export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple PIP_EXTRA_INDEX_URL= UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple; timeout {timeout} {code} {args})"
         full_command = ["/bin/sh", "-c", command]
         try:
             # Define the exec function call within a lambda for the executor
@@ -1119,7 +1127,7 @@ class DockerRuntime(ExecutionEnvironment):
         if self.backend == "kubernetes":
             return self._run_kubernetes(exec_code, timeout, args, workdir=exec_workdir)
 
-        command = f"timeout {timeout} {exec_code} {args}"
+        command = f"export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple PIP_EXTRA_INDEX_URL= UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple; timeout {timeout} {exec_code} {args}"
         self.logger.info(f"started submit command: {command}")
         try:
             if "lsp_daemon >" in command:

@@ -102,6 +102,7 @@ class RepoEnv(gym.Env):
             cmd_files: List of paths to command files.
         """
         cmds = []
+        tool_python_ready = False
         for cmd_file in cmd_files:
             # Parse commands from file
             parsed_commands = self.cmd_parser.parse_command_file(cmd_file)
@@ -120,7 +121,26 @@ class RepoEnv(gym.Env):
                 else:
                     container_cmd_name = cmd_name
                 container_path = f"/usr/local/bin/{container_cmd_name}"
+                use_tool_python = self.runtime.swebench_verified and container_cmd_name in (
+                    "str_replace_editor", "execute_bash"
+                )
+                if use_tool_python and not tool_python_ready:
+                    output, code = self.runtime.run(
+                        "/opt/miniconda3/bin/python -c 'import sys; assert sys.version_info >= (3, 9)' "
+                        "&& /opt/miniconda3/bin/python -m venv /root/.swe-tools "
+                        "&& /root/.swe-tools/bin/python -m pip install chardet==5.2.0",
+                        timeout=180,
+                    )
+                    if code != "0":
+                        raise RuntimeError(f"Failed to prepare tool Python: {output}")
+                    tool_python_ready = True
                 self.runtime.copy_to_container(cmd_file, container_path)
+                if use_tool_python:
+                    output, code = self.runtime.run(
+                        f"sed -i '1c#!/root/.swe-tools/bin/python' {container_path}"
+                    )
+                    if code != "0":
+                        raise RuntimeError(f"Failed to set tool interpreter: {output}")
                 self.runtime.run(f"chmod +x {container_path}")
 
                 self.logger.info(f"Added {container_path} command to the environment.")

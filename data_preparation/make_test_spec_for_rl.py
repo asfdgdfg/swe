@@ -93,9 +93,14 @@ def make_process_fn():
         # Implement your preprocessing logic here
         if 'make_test_spec' in row:
             temp = row['make_test_spec']
-            row['make_test_spec'] = json.dumps(temp)
-            # print(row) 
-            # exit()
+            if isinstance(temp, str):
+                try:
+                    temp = json.loads(temp)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("make_test_spec is not valid JSON") from exc
+            if not isinstance(temp, dict):
+                raise TypeError(f"make_test_spec must decode to a dict, got {type(temp).__name__}")
+            row['make_test_spec'] = json.dumps(temp, ensure_ascii=False)
         row_dict = dict(row)
         # problem_statement = row_dict.get("problem_statement", "")
         return row_dict
