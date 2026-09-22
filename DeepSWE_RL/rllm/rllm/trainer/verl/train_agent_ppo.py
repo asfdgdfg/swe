@@ -25,13 +25,12 @@ def run_ppo_agent(config):
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env={
-                "working_dir": "./DeepSWE_RL/rllm/verl",
-            "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "PYTHONPATH": "./DeepSWE_RL/rllm", "WANDB_API_KEY": "xx"}})
-
-    # output_log = "./rl_env_no_uv_new.txt"
-    # print(ray.get(check_worker_env.remote(output_log)))
-
-    ray.get(train_agent.remote(config))
+            "working_dir": "./DeepSWE_RL/rllm/verl",
+            "env_vars": {
+                "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
+                "PYTHONPATH": "./DeepSWE_RL/rllm", "WANDB_API_KEY": "xx",
+            },
+        })
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
