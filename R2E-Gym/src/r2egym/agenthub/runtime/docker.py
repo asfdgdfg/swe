@@ -1485,6 +1485,13 @@ class DockerRuntime(ExecutionEnvironment):
             1 for status in eval_status_map.values()
             if status is True or str(status).lower() in {"pass", "passed", "true", "1"}
         )
+        pass_ratio = passed_tests / total_tests if total_tests else 0.0
+        print(
+            f"SWE-SMITH TEST RATIO: instance={self.repo_name}, "
+            f"passed={passed_tests}, total={total_tests}, "
+            f"failed={total_tests - passed_tests}, ratio={pass_ratio:.4f}",
+            flush=True,
+        )
         self.logger.info(
             f"SWE-smith test summary: total={total_tests}, "
             f"passed={passed_tests}, failed={total_tests - passed_tests}, "
