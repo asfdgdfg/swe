@@ -33,6 +33,8 @@ def run_ppo_agent(config):
         })
 
 
+    ray.get(train_agent.remote(config))
+
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 def train_agent(config, agent_class=None, env_class=None, agent_args=None, env_args=None):
     # print initial config
