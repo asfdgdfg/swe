@@ -131,6 +131,7 @@ class SWEAgent(BaseAgent):
             # print(f"now in update_from_env self._trajectory.step else: self.user_prompt_template: {self.user_prompt_template}")
             observation = self.user_prompt_template.replace("[problem_statement]", observation).replace("[working_dir]", "/testbed")
             user_prompt_flag = True
+            print(f"SWE placeholder substitution: problem_statement={'[problem_statement]' not in observation}, working_dir={'[working_dir]' not in observation}")
             print(f"now in update_from_env self._trajectory.step else done")
 
         print(f"now in update_from_env has get obs")

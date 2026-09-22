@@ -543,7 +543,9 @@ class AgentExecutionEngine:
             else:
                 color = "yellow"
             print(
-                f"Trajectory {idx} completed due to: {termination_reason}. Reward is {reward}. \n",
+                f"Trajectory {idx} completed due to: {termination_reason}. Reward is {reward}. "
+                f"steps={len(agent.trajectory.steps)}, prompt_tokens={len(prompt_tokens)}, "
+                f"response_tokens={len(response_tokens)}, model_gen_tokens={model_gen_tokens_len}.\n",
             )
             if masked_out:
                 if process_terminated:

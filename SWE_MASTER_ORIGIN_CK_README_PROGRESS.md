@@ -94,3 +94,21 @@
 - 评测结果：`ROOT/R2E-Gym/results/`。
 - 模型：`ROOT/models/`。
 - 原始完整交接备份：由覆盖前自动生成，文件名含 `.before_compact_`。
+## 2026-09-22 最新进度（离线数据恢复与 7B RL）
+
+- 未重新下载 Hugging Face 数据；使用远端已有 cache 离线恢复 RL 数据。
+- 从本地 Arrow cache 合并生成全量训练 parquet，共 4,578 条样本，字段为 prompt / reward_model / extra_info，文件大小约 900 MB。
+- 训练数据：DeepSWE_RL/rllm/rllm/data/datasets/SWE_FULL_4578/train_00000_verl.parquet。
+- 当前 7B RL 训练使用 origin_ck 分支、Qwen2.5-Coder-7B-Instruct、data.max_response_length=32768，8 卡启动。
+- 训练会话：tmux swe7b_full。
+- 训练日志：/home/yyk/yyk11/zhongtianyang/memory/origin_ck_7b_full4578_len32768.log。
+- 训练刚启动时 tmux 会话仍存活，尚未据此宣称训练已产生有效 reward 或 checkpoint；后续需检查首次 rollout、actor update、显存和最终结果。
+- 之前的 Hugging Face 下载任务因 aria2c CA 证书错误失败，不影响本次离线恢复；不要把该下载失败误判为数据不存在。
+
+## 2026-09-23 SWE-smith 训练修复记录
+
+- 已按仓库 README 的环境方式使用 `DeepSWE_RL/rllm/.venv/bin/python` 启动 SWE-smith 7B 训练；训练数据为 `SWE_SMITH_172_IMAGES/train_verl.parquet`，验证集为 `val_verl.parquet`。
+- 发现并修复 SWE-smith reward 边界类型错误：`R2E-Gym/src/r2egym/agenthub/runtime/docker.py` 在无解析结果时原先无条件返回 `(0.0, output)`，而 `rllm/engine/agent_execution_engine.py` 在普通 reward 路径执行 `reward > 0`，触发 `TypeError: tuple and int`。
+- 修复后仅在 `get_test_output=True` 时返回 `(reward, output)`，普通训练路径返回标量 `float`；原文件备份为 `docker.py.before_reward_fix_20260923`。
+- 修复前的 `swe7b_swesmith_venv` 进程已停止，待修复后的最小导入/运行核验通过后再启动新实验；旧日志 `swesmith_7b_172_venv.log` 保留，不将修复前结果计入性能。
+- 尚未解决的问题：部分 SWE-smith 容器测试文件 reset 报 `Exit code 123`，以及并发清理时偶发 Docker 404；这些与 reward tuple 修复分开核查，不能宣称已解决。

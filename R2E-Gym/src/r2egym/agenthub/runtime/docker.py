@@ -643,13 +643,15 @@ class DockerRuntime(ExecutionEnvironment):
              # Use robust command construction to avoid argument length limits if any
              cmd = (
                 f'printf "%s\\n" {" ".join(all_files)} | '
-                f'xargs -n1 -I{{}} git checkout HEAD~1 -- "{{}}" 2>/dev/null'
+                # GNU xargs treats -n and -I as conflicting options; the
+                # conflict made xargs exit 123 before any checkout ran.
+                f'xargs -I{{}} git checkout HEAD~1 -- "{{}}" 2>/dev/null'
             )
              cmds.append(cmd)
         
         return cmds
 
-    def reset_swesmith_tests(self):
+    def reset_swesmith_tests(self) -> bool:
         self.logger.info(f"nwo in reset_swesmith_tests")
         
         # [NEW] Use shared helper for consistency
@@ -663,9 +665,12 @@ class DockerRuntime(ExecutionEnvironment):
 
         if error_code != "0":
             self.logger.error(f"Error resetting test files for swesmith: output: {output}, error_code: {error_code}")
-            raise Exception(f"Error resetting test files for swesmith:  output: {output}, error_code: {error_code}")
+            # A failed reset should produce a zero-reward sample, not abort
+            # the rollout and leak a (reward, output) tuple to the agent loop.
+            return False
         else:
             self.logger.info(f"successfully reset swesmith test files, output: {output}, error_code: {error_code}")
+            return True
 
 
     def setup_env_swegym(self):
@@ -1465,7 +1470,8 @@ class DockerRuntime(ExecutionEnvironment):
  
     def _calculate_reward_swesmith(self, get_test_output=False, timeout: int = 1800) -> Tuple[float, str]:
         self.logger.info(f"nwo in _calculate_reward_swesmith")
-        self.reset_swesmith_tests()
+        if not self.reset_swesmith_tests():
+            return (0.0, "") if get_test_output else 0.0
         self.logger.info(f"nwo in _calculate_reward_swesmith after reset_swesmith_tests")
         output, error_msg = self.run("/run_tests.sh", timeout=timeout)
         self.logger.info(f"nwo in _calculate_reward_swesmith after run_tests.sh")
@@ -1474,9 +1480,21 @@ class DockerRuntime(ExecutionEnvironment):
         
         # [NEW] Replaced ad-hoc parsing with swesmith grading logic
         eval_status_map = self.parse_logs(output)
+        total_tests = len(eval_status_map)
+        passed_tests = sum(
+            1 for status in eval_status_map.values()
+            if status is True or str(status).lower() in {"pass", "passed", "true", "1"}
+        )
+        self.logger.info(
+            f"SWE-smith test summary: total={total_tests}, "
+            f"passed={passed_tests}, failed={total_tests - passed_tests}, "
+            f"statuses={eval_status_map}"
+        )
         
         if not eval_status_map:
-             return 0.0, output
+             # The agent engine expects a scalar reward unless test output was
+             # explicitly requested.  Keep the diagnostic output opt-in.
+             return (0.0, output) if get_test_output else 0.0
 
         eval_ref = {
             FAIL_TO_PASS: self.ds.get(FAIL_TO_PASS, []),
@@ -1610,12 +1628,11 @@ class DockerRuntime(ExecutionEnvironment):
             return self._calculate_reward_swebench(get_test_output=get_test_output, timeout=timeout)
         elif self.swesmith:
             self.logger.info(f"SWE-smith Calculating reward")
-            if get_test_output:
-                real_reward, real_output = self._calculate_reward_swesmith(get_test_output=get_test_output, timeout=timeout)
-                return real_reward, real_output
-            else:
-                real_reward = self._calculate_reward_swesmith(get_test_output=get_test_output, timeout=timeout)
-                return real_reward
+            # The agent execution engine always consumes a scalar reward
+            # (`reward > 0`).  Never leak the optional diagnostic tuple from
+            # the runtime into this training-facing API.
+            result = self._calculate_reward_swesmith(get_test_output=get_test_output, timeout=timeout)
+            return result[0] if isinstance(result, tuple) else float(result)
         elif self.swegym:
             self.logger.info(f"SWE-gym Calculating reward")
             # return self._calculate_reward_swegym(get_test_output=get_test_output, timeout=timeout)
