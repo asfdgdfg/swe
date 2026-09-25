@@ -670,6 +670,9 @@ class AgentPPOTrainer(RayPPOTrainer):
                     try:
                         obj_now = {
                             "chat_completion":chat_completions[idx_write],
+                            "rendered_prompt": trajectories[idx_write].get("rendered_prompt", ""),
+                            "chat_template_parser": trajectories[idx_write].get("chat_template_parser", ""),
+                            "prompt_token_count": int(trajectories[idx_write]["prompt_tokens"].numel()),
                             "traj_score":float(traj_scores[idx_write]),
                             "traj_metric":traj_metrics_ori[idx_write],
                             # "global_step":int(self.global_steps),

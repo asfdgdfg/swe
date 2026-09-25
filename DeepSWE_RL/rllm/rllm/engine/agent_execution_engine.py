@@ -568,6 +568,11 @@ class AgentExecutionEngine:
                 "trajectory_reward": trajectory.reward,
                 "idx": env.idx,
                 "chat_completions": agent.chat_completions,
+                # Preserve exactly what the chat parser renders for the next model call.
+                "rendered_prompt": self.chat_parser.parse(
+                    agent.chat_completions.copy(), add_generation_prompt=True, is_first_msg=True
+                ),
+                "chat_template_parser": type(self.chat_parser).__name__,
                 "termination_reason":termination_reason if termination_reason else "",
                 "metrics": {
                     # Total number of steps taken in the trajectory

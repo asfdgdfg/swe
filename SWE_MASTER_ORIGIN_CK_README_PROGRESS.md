@@ -112,3 +112,41 @@
 - 修复后仅在 `get_test_output=True` 时返回 `(reward, output)`，普通训练路径返回标量 `float`；原文件备份为 `docker.py.before_reward_fix_20260923`。
 - 修复前的 `swe7b_swesmith_venv` 进程已停止，待修复后的最小导入/运行核验通过后再启动新实验；旧日志 `swesmith_7b_172_venv.log` 保留，不将修复前结果计入性能。
 - 尚未解决的问题：部分 SWE-smith 容器测试文件 reset 报 `Exit code 123`，以及并发清理时偶发 Docker 404；这些与 reward tuple 修复分开核查，不能宣称已解决。
+
+## 2026-09-23 7B case 记录训练
+
+- 为查看完整训练 case，启用了训练器已有的 chat-completions 持久化逻辑；每个训练 step 写入 chat_completions/<step>.jsonl。
+- 每条记录包含完整输入消息、assistant 输出、工具调用/环境反馈、traj_score、termination_reason 和轨迹指标。
+- 新实验使用 origin_ck 分支、Qwen2.5-Coder-7B-Instruct、全量 SWE_FULL_4578 数据（4,578 条），max_response_length=32768。
+- 为避免 Ray 临时目录清理，设置了持久化 default_local_dir：
+  /home/yyk/yyk11/zhongtianyang/memory/SWE-Master/DeepSWE_RL/rllm/checkpoints/swe_master/swesmith_7b_cases_20260923
+- 训练日志：
+  /home/yyk/yyk11/zhongtianyang/memory/swesmith_7b_cases_20260923.log
+- tmux 会话：swe7b_cases。
+- 启动时确认使用 RL 环境 Python 3.11.13：
+  /home/yyk/yyk11/zhongtianyang/memory/SWE-Master/DeepSWE_RL/rllm/.venv/bin/python
+- 启动初期尚未生成第一个 chat_completions 文件；需等首个训练 step 完成后核验 case 文件、reward 和训练状态。
+## 2026-09-25 Qwen3-4B SWE-smith 长度扩展训练
+
+- 已停止旧的 `qwen3_4b_len32768_20260925` 进程，并启动新进程 PID `13546`。
+- 新实验名：`qwen3_4b_len51200_20260925`；日志：`/home/yyk/yyk11/zhongtianyang/memory/qwen3_4b_len51200_20260925.log`。
+- 新配置：`data.max_response_length=51200`；actor/ref/rollout token 上限、`max_model_len` 和 `max_num_batched_tokens` 均为 `57344`。
+- 数据集仍为 `SWE_SMITH_FULL_NONEMPTY_VERIFIED/train_verl.parquet`，模型仍为本地 `Qwen3-4B`，`train_batch_size=8`、`rollout.n=4`，每个全局训练 step 预计收集 32 条 trajectory。
+- 截至本次记录，训练已进入 rollout，单个样本最高推进到约 agent step 195；已完成 trajectory 约 5 条，尚未完成第一批 32 条，因此尚未发生第一次 actor 参数更新。
+- GPU 显存约 47GB/卡，利用率约 29%–76%；进程和 Ray/vLLM 正常，暂未发现 Traceback、CUDA OOM 或启动错误。
+- `SWE-SMITH TEST RATIO` 仅用于记录单样本测试通过比例；训练实际 reward 仍由 resolution status 判定为 0.0/1.0。
+
+## 2026-09-23 Qwen3-4B RL 训练状态
+
+- 仓库/分支：`/home/yyk/yyk11/zhongtianyang/memory/SWE-Master`，`origin_ck`。
+- 模型：官方本地权重 `/home/yyk/yyk11/zhongtianyang/memory/models/Qwen3-4B`，约 4.02B 参数。
+- 启动脚本：`/tmp/run_qwen3_4b.sh`；tmux session：`qwen3_rl`；主进程 PID：`72703`。
+- 实验名：`qwen3_4b_verified_20260923`；输出目录：`DeepSWE_RL/rllm/checkpoints/swe_master/qwen3_4b_verified_20260923`。
+- 数据：`SWE_SMITH_FULL_NONEMPTY_VERIFIED/train_verl.parquet`，41103 条；`train_batch_size=8`、`rollout.n=4`，因此每个训练 step 为 32 条 rollout；总训练 step 为 5137。
+- 长度：`max_prompt_length=8192`、`max_response_length=24576`、`max_model_len=32768`、actor/ref/rollout token 上限为 32768。
+- 工具协议已回退到 init commit `fb864a7` 的原始 `<function=...><parameter=...>` 解析和原始 SWE-Agent prompt；恢复支持 `execute_bash`、`str_replace_editor`、`submit` 等原始工具。保留 `problem_statement` 占位符兼容修复。
+- 此前失败的 Qwen3 进程使用后改的 `<tool_call>` JSON parser，并错误地只允许 `execute_bash`，导致 `str_replace_editor` 被拒绝、JSONDecodeError 及空轨迹断言；该旧进程已停止。
+- 当前新训练已完成 Qwen3 checkpoint、FSDP、Ray/vLLM 初始化并进入 `epoch 0, step 1`；8 张 GPU 均约占用 48GB。
+- 截至同步时，第 1 个 batch 已完成 31/32 条 rollout；尚未完成的是 `Trajectory 14`，因此还未进入 step 2。
+- 已完成 31 条的 reward 分布：reward 0.0 为 29 条，reward 1.0 为 2 条（Trajectory 10、15）。大量轨迹因 `TRUNCATION` 在 24576 response tokens 上限结束。
+- 新进程截至同步时未再出现 `Unsupported tool: str_replace_editor`、JSONDecodeError 或 `Trajectory cannot complete`。
