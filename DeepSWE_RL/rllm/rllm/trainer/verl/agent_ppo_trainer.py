@@ -4,10 +4,12 @@ import math
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from functools import reduce
 from pprint import pprint
 from queue import Queue
 from threading import Thread
+from typing import Any
 
 import numpy as np
 import torch
@@ -46,6 +48,760 @@ except Exception:
     raise ValueError("part2.find R2EGYM_PATH ERROR！！！！")
 
 
+@dataclass
+class EpisodeRecord:
+    source_batch_idx: int
+    episode_id: str
+    group_uid: str
+    reward: float
+    termination_reason: str
+    policy_segments: list[dict[str, Any]]
+    scalar_advantage: float | None = None
+    policy_token_count: int | None = None
+
+
+@dataclass
+class EpisodeRecordBuildResult:
+    episodes: list[EpisodeRecord]
+    retained_source_batch_indices: list[int]
+    dropped_group_uids: list[str]
+    invalid_source_batch_indices: list[int]
+    skip_batch: bool
+
+
+@dataclass
+class RejectionSamplingSelection:
+    valid_mask: torch.Tensor
+    solve_none: int
+    solve_all: int
+    solve_partial: int
+
+
+@dataclass
+class AgentTrajectoryGenerationResult:
+    trajectories: list[dict[str, Any]]
+    transformed: DataProto
+    metrics: dict[str, Any]
+
+
+@dataclass
+class DistributedEpisodeAssignment:
+    target_dp_by_source: dict[int, int]
+    episode_cost_by_source: dict[int, int]
+    dp_costs_by_step: dict[int, list[int]]
+
+
+def _pack_episode_optimizer_steps(
+    episodes: list[EpisodeRecord], episode_mini_batch_size: int
+) -> list[list[EpisodeRecord]]:
+    if not isinstance(episode_mini_batch_size, int) or isinstance(
+        episode_mini_batch_size, bool
+    ) or episode_mini_batch_size <= 0:
+        raise ValueError(
+            "agent.compression_episode_mini_batch_size must be an integer greater than 0"
+        )
+    return [
+        episodes[start : start + episode_mini_batch_size]
+        for start in range(0, len(episodes), episode_mini_batch_size)
+    ]
+
+
+def _episode_compute_cost(episode: EpisodeRecord) -> int:
+    return sum(
+        len(segment["prompt_tokens"]) + len(segment["response_tokens"])
+        for segment in episode.policy_segments
+    )
+
+
+def _assign_episode_buckets_to_dp(
+    buckets: list[list[EpisodeRecord]], effective_dp_degree: int
+) -> DistributedEpisodeAssignment:
+    if effective_dp_degree <= 0:
+        raise ValueError("effective_dp_degree must be positive")
+    target_dp_by_source = {}
+    episode_cost_by_source = {}
+    dp_costs_by_step = {}
+    for step_id, bucket in enumerate(buckets):
+        dp_costs = [0] * effective_dp_degree
+        ordered = sorted(
+            bucket,
+            key=lambda episode: (-_episode_compute_cost(episode), episode.source_batch_idx),
+        )
+        for episode in ordered:
+            cost = _episode_compute_cost(episode)
+            target_dp = min(range(effective_dp_degree), key=lambda dp: (dp_costs[dp], dp))
+            target_dp_by_source[episode.source_batch_idx] = target_dp
+            episode_cost_by_source[episode.source_batch_idx] = cost
+            dp_costs[target_dp] += cost
+        dp_costs_by_step[step_id] = dp_costs
+    return DistributedEpisodeAssignment(
+        target_dp_by_source=target_dp_by_source,
+        episode_cost_by_source=episode_cost_by_source,
+        dp_costs_by_step=dp_costs_by_step,
+    )
+
+
+def _make_compression_dummy_segment(
+    *, step_id: int, target_dp_replica: int, dummy_index: int, eos_token_id: int
+) -> dict[str, Any]:
+    """Return a minimal, unpadded dummy representation independent of padding policy."""
+    return {
+        "episode_id": f"__compression_dummy__step{step_id}_dp{target_dp_replica}_row{dummy_index}",
+        "group_uid": "__dummy__",
+        "segment_id": -1,
+        "source_batch_idx": -1,
+        "optimizer_step_id": step_id,
+        "target_dp_replica": target_dp_replica,
+        "is_dummy": True,
+        "prompt_tokens": [int(eos_token_id)],
+        "response_tokens": [int(eos_token_id)],
+        "policy_mask": [0],
+        "scalar_advantage": 0.0,
+        "episode_normalized_weight": [0.0],
+        "actor_token_weight": [0.0],
+    }
+
+
+def _physical_rank_major_row_indices(
+    rows: list[dict[str, Any]], *, effective_dp_degree: int, sp_size: int
+) -> list[int]:
+    """Lay out equal logical DP rows as equal physical-rank chunks."""
+    if sp_size <= 0:
+        raise ValueError("sp_size must be positive")
+    step_ids = sorted({int(row["optimizer_step_id"]) for row in rows})
+    per_physical_rank = [[] for _ in range(effective_dp_degree * sp_size)]
+    for step_id in step_ids:
+        dp_rows = []
+        for dp in range(effective_dp_degree):
+            indices = [
+                index
+                for index, row in enumerate(rows)
+                if int(row["optimizer_step_id"]) == step_id
+                and int(row["target_dp_replica"]) == dp
+            ]
+            dp_rows.append(indices)
+        target_rows = {len(indices) for indices in dp_rows}
+        if len(target_rows) != 1:
+            raise ValueError(
+                f"optimizer_step_id={step_id} has unequal logical DP row counts: "
+                f"{[len(indices) for indices in dp_rows]}"
+            )
+        row_count = target_rows.pop()
+        if row_count % sp_size != 0:
+            raise ValueError(
+                f"optimizer_step_id={step_id} target rows {row_count} are not divisible by SP={sp_size}"
+            )
+        local_rows = row_count // sp_size
+        for dp, indices in enumerate(dp_rows):
+            for sp_rank in range(sp_size):
+                physical_rank = dp * sp_size + sp_rank
+                start = sp_rank * local_rows
+                per_physical_rank[physical_rank].extend(indices[start : start + local_rows])
+    physical_lengths = {len(indices) for indices in per_physical_rank}
+    if len(physical_lengths) != 1:
+        raise ValueError(
+            f"Physical-rank chunks must have equal lengths: "
+            f"{[len(indices) for indices in per_physical_rank]}"
+        )
+    return [index for rank_indices in per_physical_rank for index in rank_indices]
+
+
+def _select_unique_sp_result(results: Any, *, operation: str) -> DataProto:
+    """Collapse ONE_TO_ALL SP views without concatenating logical rows."""
+    if isinstance(results, DataProto):
+        return results
+    if not isinstance(results, (list, tuple)) or not results:
+        raise ValueError(f"{operation} returned no SP worker results")
+    if not all(isinstance(result, DataProto) for result in results):
+        raise TypeError(f"{operation} must return DataProto from every SP rank")
+    canonical = results[0]
+    canonical_keys = list(canonical.batch.keys())
+    canonical_rows = (
+        next(iter(canonical.batch.values())).shape[0] if canonical_keys else None
+    )
+    for rank, result in enumerate(results[1:], start=1):
+        result_keys = list(result.batch.keys())
+        result_rows = (
+            next(iter(result.batch.values())).shape[0] if result_keys else None
+        )
+        if result_rows != canonical_rows:
+            raise ValueError(
+                f"{operation} changed logical row count across SP ranks: "
+                f"rank0={canonical_rows}, rank{rank}={result_rows}"
+            )
+        if set(result.batch.keys()) != set(canonical.batch.keys()):
+            raise ValueError(f"{operation} returned inconsistent tensor fields across SP ranks")
+        for key in canonical.batch.keys():
+            if canonical.batch[key].shape != result.batch[key].shape:
+                raise ValueError(
+                    f"{operation} returned inconsistent {key} shape across SP ranks"
+                )
+            if not torch.allclose(
+                canonical.batch[key].to(torch.float32),
+                result.batch[key].to(torch.float32),
+                rtol=1e-5,
+                atol=1e-7,
+            ):
+                raise ValueError(
+                    f"{operation} returned inconsistent {key} values across SP ranks"
+                )
+    return canonical
+
+
+def _build_episode_advantage_batch(episodes: list[EpisodeRecord], pad_token_id: int) -> DataProto:
+    """Represent each real episode by one reward-bearing token for GRPO."""
+    if not episodes:
+        raise ValueError("Cannot compute episode-level advantages for an empty episode list")
+    rewards = torch.tensor([episode.reward for episode in episodes], dtype=torch.float32).unsqueeze(-1)
+    tokens = torch.full((len(episodes), 1), int(pad_token_id), dtype=torch.long)
+    return DataProto.from_dict(
+        tensors={
+            "prompts": tokens.clone(),
+            "responses": tokens.clone(),
+            "input_ids": torch.cat([tokens, tokens], dim=-1),
+            "attention_mask": torch.ones((len(episodes), 2), dtype=torch.long),
+            "position_ids": torch.tensor([[0, 1]], dtype=torch.long).repeat(len(episodes), 1),
+            "token_level_scores": rewards.clone(),
+            "token_level_rewards": rewards,
+        },
+        non_tensors={
+            "uid": np.array([episode.group_uid for episode in episodes], dtype=object),
+            "source_batch_idx": np.array([episode.source_batch_idx for episode in episodes]),
+        },
+    )
+
+
+def _tensor_numel(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return value.numel()
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def _build_episode_records(
+    trajectories: list[dict[str, Any]],
+    repeated_group_uids: np.ndarray,
+) -> EpisodeRecordBuildResult:
+    """Bind rollout results to their explicit repeated-batch rows.
+
+    Missing or invalid rollouts invalidate their complete GRPO group. This is a
+    pure preparation helper and is deliberately not connected to the live actor
+    path in stage 7C-A.
+    """
+    expected_num_rows = len(repeated_group_uids)
+    expected_indices = set(range(expected_num_rows))
+    trajectories_by_idx: dict[int, dict[str, Any]] = {}
+    episode_ids: set[str] = set()
+    invalid_source_indices: set[int] = set()
+
+    for trajectory in trajectories:
+        if "idx" not in trajectory:
+            raise ValueError("Trajectory is missing required source batch field 'idx'")
+        source_batch_idx = int(trajectory["idx"])
+        if source_batch_idx < 0 or source_batch_idx >= expected_num_rows:
+            raise ValueError(
+                f"Trajectory source_batch_idx={source_batch_idx} is outside repeated batch range "
+                f"[0, {expected_num_rows})"
+            )
+        if source_batch_idx in trajectories_by_idx:
+            raise ValueError(f"Duplicate trajectory source_batch_idx={source_batch_idx}")
+        trajectories_by_idx[source_batch_idx] = trajectory
+
+        episode_id = trajectory.get("episode_id")
+        if not isinstance(episode_id, str) or not episode_id:
+            invalid_source_indices.add(source_batch_idx)
+        elif episode_id in episode_ids:
+            raise ValueError(f"Duplicate trajectory episode_id={episode_id!r}")
+        else:
+            episode_ids.add(episode_id)
+
+        policy_segments = trajectory.get("policy_segments")
+        if (
+            _tensor_numel(trajectory.get("prompt_tokens")) == 0
+            or _tensor_numel(trajectory.get("response_tokens")) == 0
+            or "trajectory_reward" not in trajectory
+            or not isinstance(policy_segments, list)
+            or len(policy_segments) == 0
+        ):
+            invalid_source_indices.add(source_batch_idx)
+
+    missing_indices = expected_indices - set(trajectories_by_idx)
+    invalid_source_indices.update(missing_indices)
+    invalid_group_uids = {
+        str(repeated_group_uids[source_batch_idx])
+        for source_batch_idx in invalid_source_indices
+    }
+
+    retained_source_indices = [
+        source_batch_idx
+        for source_batch_idx in range(expected_num_rows)
+        if str(repeated_group_uids[source_batch_idx]) not in invalid_group_uids
+    ]
+
+    episodes = []
+    for source_batch_idx in retained_source_indices:
+        trajectory = trajectories_by_idx[source_batch_idx]
+        episodes.append(
+            EpisodeRecord(
+                source_batch_idx=source_batch_idx,
+                episode_id=trajectory["episode_id"],
+                group_uid=str(repeated_group_uids[source_batch_idx]),
+                reward=float(trajectory["trajectory_reward"]),
+                termination_reason=str(trajectory.get("termination_reason", "")),
+                policy_segments=trajectory["policy_segments"],
+            )
+        )
+
+    return EpisodeRecordBuildResult(
+        episodes=episodes,
+        retained_source_batch_indices=retained_source_indices,
+        dropped_group_uids=sorted(invalid_group_uids),
+        invalid_source_batch_indices=sorted(invalid_source_indices),
+        skip_batch=len(episodes) == 0,
+    )
+
+
+def _compute_rejection_sampling_selection(
+    uids: np.ndarray,
+    reward_tensor: torch.Tensor,
+) -> RejectionSamplingSelection:
+    """Mirror the current AgentPPOTrainer episode-level rejection semantics."""
+    unique_uids = np.unique(uids)
+    valid_mask = torch.ones(len(uids), dtype=torch.bool)
+    solve_none = 0
+    solve_all = 0
+    for uid in unique_uids:
+        uid_mask = uids == uid
+        uid_rewards = reward_tensor[uid_mask].sum(-1)
+        if (uid_rewards <= 0).all():
+            valid_mask[uid_mask] = False
+            solve_none += 1
+        elif (uid_rewards >= 1).all():
+            valid_mask[uid_mask] = False
+            solve_all += 1
+    return RejectionSamplingSelection(
+        valid_mask=valid_mask,
+        solve_none=solve_none,
+        solve_all=solve_all,
+        solve_partial=len(unique_uids) - solve_none - solve_all,
+    )
+
+
+def _extract_episode_scalar_advantages(
+    episodes: list[EpisodeRecord],
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    row_source_batch_indices: list[int] | np.ndarray,
+    *,
+    rtol: float = 1e-5,
+    atol: float = 1e-7,
+) -> None:
+    """Attach one verified scalar GRPO advantage to each episode record."""
+    if advantages.shape != response_mask.shape:
+        raise ValueError(
+            f"advantages shape {tuple(advantages.shape)} does not match response_mask "
+            f"shape {tuple(response_mask.shape)}"
+        )
+    if advantages.shape[0] != len(row_source_batch_indices):
+        raise ValueError("Advantage rows do not match source_batch_idx rows")
+
+    episodes_by_source = {episode.source_batch_idx: episode for episode in episodes}
+    if len(episodes_by_source) != len(episodes):
+        raise ValueError("Episode records contain duplicate source_batch_idx values")
+
+    attached_sources = set()
+    for row_idx, source_batch_idx_value in enumerate(row_source_batch_indices):
+        source_batch_idx = int(source_batch_idx_value)
+        episode = episodes_by_source.get(source_batch_idx)
+        if episode is None:
+            raise ValueError(f"No EpisodeRecord for advantage source_batch_idx={source_batch_idx}")
+        if source_batch_idx in attached_sources:
+            raise ValueError(f"Duplicate advantage row for source_batch_idx={source_batch_idx}")
+
+        valid_values = advantages[row_idx][response_mask[row_idx].bool()]
+        if valid_values.numel() == 0:
+            raise ValueError(f"Episode {episode.episode_id!r} has no valid response advantage positions")
+        if not torch.isfinite(valid_values).all():
+            raise ValueError(f"Episode {episode.episode_id!r} has non-finite advantages")
+        reference_value = valid_values[0]
+        if not torch.allclose(
+            valid_values,
+            torch.full_like(valid_values, reference_value),
+            rtol=rtol,
+            atol=atol,
+        ):
+            raise ValueError(
+                f"Episode {episode.episode_id!r} does not have one consistent scalar advantage: "
+                f"{valid_values.tolist()}"
+            )
+        episode.scalar_advantage = float(reference_value.item())
+        attached_sources.add(source_batch_idx)
+
+    missing_sources = set(episodes_by_source) - attached_sources
+    if missing_sources:
+        raise ValueError(f"Missing advantage rows for source_batch_idx={sorted(missing_sources)}")
+
+
+def _compute_episode_policy_token_count(episode: EpisodeRecord) -> int:
+    """Validate Stage 6 segments and attach the episode-wide policy-token count."""
+    segment_ids = set()
+    policy_token_count = 0
+    for segment in episode.policy_segments:
+        segment_id = int(segment["segment_id"])
+        if segment_id in segment_ids:
+            raise ValueError(
+                f"Episode {episode.episode_id!r} has duplicate segment_id={segment_id}"
+            )
+        segment_ids.add(segment_id)
+
+        response_tokens = segment["response_tokens"]
+        policy_mask = segment["policy_mask"]
+        if len(response_tokens) != len(policy_mask):
+            raise ValueError(
+                f"Episode {episode.episode_id!r} segment {segment_id} has "
+                f"response_tokens={len(response_tokens)} but policy_mask={len(policy_mask)}"
+            )
+        invalid_mask_values = [value for value in policy_mask if value not in (0, 1)]
+        if invalid_mask_values:
+            raise ValueError(
+                f"Episode {episode.episode_id!r} segment {segment_id} has non-binary "
+                f"policy_mask values: {invalid_mask_values[:5]}"
+            )
+        policy_token_count += sum(int(value) for value in policy_mask)
+
+    if policy_token_count == 0:
+        raise ValueError(
+            "Episode has zero policy tokens: "
+            f"episode_id={episode.episode_id!r}, group_uid={episode.group_uid!r}, "
+            f"source_batch_idx={episode.source_batch_idx}, "
+            f"termination_reason={episode.termination_reason!r}, "
+            f"segment_count={len(episode.policy_segments)}"
+        )
+    episode.policy_token_count = policy_token_count
+    return policy_token_count
+
+
+def _transform_policy_segments(
+    episodes: list[EpisodeRecord],
+    *,
+    max_prompt_length: int,
+    max_response_length: int,
+    pad_token_id: int,
+    optimizer_step_by_source: dict[int, int] | None = None,
+    effective_dp_degree: int | None = None,
+) -> DataProto:
+    """Create the CPU segment DataProto used by stage 7C-A structural tests."""
+    raw_segments = [
+        segment
+        for episode in episodes
+        for segment in episode.policy_segments
+    ]
+    if not raw_segments:
+        raise ValueError("Cannot transform an empty list of policy segments")
+
+    # The configured lengths are hard limits, not tensor target widths.  The
+    # rectangular DataProto carrier only needs to be as wide as this packed
+    # segment batch; the actor trims it again for each forward microbatch.
+    prompt_carrier_width = max(len(segment["prompt_tokens"]) for segment in raw_segments)
+    response_carrier_width = max(len(segment["response_tokens"]) for segment in raw_segments)
+    segment_rows = []
+    for episode in episodes:
+        if episode.scalar_advantage is None:
+            raise ValueError(f"Episode {episode.episode_id!r} is missing scalar_advantage")
+        policy_token_count = _compute_episode_policy_token_count(episode)
+        optimizer_step_id = (
+            optimizer_step_by_source.get(episode.source_batch_idx)
+            if optimizer_step_by_source is not None
+            else None
+        )
+        for segment in episode.policy_segments:
+            prompt_tokens = list(segment["prompt_tokens"])
+            response_tokens = list(segment["response_tokens"])
+            policy_mask = [int(value) for value in segment["policy_mask"]]
+            segment_id = int(segment["segment_id"])
+
+            if len(prompt_tokens) > max_prompt_length:
+                raise ValueError(
+                    f"Segment prompt exceeds configured limit: episode_id={episode.episode_id!r}, "
+                    f"segment_id={segment_id}, actual_prompt_length={len(prompt_tokens)}, "
+                    f"max_prompt_length={max_prompt_length}"
+                )
+            if len(response_tokens) > max_response_length:
+                raise ValueError(
+                    f"Segment response exceeds configured limit: episode_id={episode.episode_id!r}, "
+                    f"segment_id={segment_id}, actual_response_length={len(response_tokens)}, "
+                    f"max_response_length={max_response_length}"
+                )
+
+            padded_prompt = [pad_token_id] * (prompt_carrier_width - len(prompt_tokens)) + prompt_tokens
+            padded_response = response_tokens + [pad_token_id] * (response_carrier_width - len(response_tokens))
+            prompt_attention = [0] * (prompt_carrier_width - len(prompt_tokens)) + [1] * len(prompt_tokens)
+            response_attention = [1] * len(response_tokens) + [0] * (response_carrier_width - len(response_tokens))
+            padded_policy_mask = policy_mask + [0] * (response_carrier_width - len(policy_mask))
+
+            policy_mask_tensor = torch.tensor(padded_policy_mask, dtype=torch.long)
+            segment_rows.append(
+                {
+                    "episode": episode,
+                    "segment_id": segment_id,
+                    "prompts": torch.tensor(padded_prompt, dtype=torch.long),
+                    "responses": torch.tensor(padded_response, dtype=torch.long),
+                    "attention_mask": torch.tensor(prompt_attention + response_attention, dtype=torch.long),
+                    "policy_mask": policy_mask_tensor,
+                    "advantages": policy_mask_tensor.to(torch.float32) * episode.scalar_advantage,
+                    "episode_normalized_weight": policy_mask_tensor.to(torch.float32) / policy_token_count,
+                    "actor_token_weight": (
+                        policy_mask_tensor.to(torch.float32) / policy_token_count
+                        if optimizer_step_by_source is not None
+                        else None
+                    ),
+                    "optimizer_step_id": optimizer_step_id,
+                }
+            )
+
+    if not segment_rows:
+        raise ValueError("Cannot transform an empty list of policy segments")
+
+    tensor_batch = {
+        "prompts": torch.stack([row["prompts"] for row in segment_rows]),
+        "responses": torch.stack([row["responses"] for row in segment_rows]),
+        "attention_mask": torch.stack([row["attention_mask"] for row in segment_rows]),
+        "policy_mask": torch.stack([row["policy_mask"] for row in segment_rows]),
+        "advantages": torch.stack([row["advantages"] for row in segment_rows]),
+        "episode_normalized_weight": torch.stack(
+            [row["episode_normalized_weight"] for row in segment_rows]
+        ),
+    }
+    if optimizer_step_by_source is not None:
+        tensor_batch["actor_token_weight"] = torch.stack(
+            [row["actor_token_weight"] for row in segment_rows]
+        )
+    tensor_batch["input_ids"] = torch.cat(
+        [tensor_batch["prompts"], tensor_batch["responses"]], dim=-1
+    )
+    tensor_batch["position_ids"] = (
+        torch.cumsum(tensor_batch["attention_mask"], dim=-1) - 1
+    ) * tensor_batch["attention_mask"]
+
+    non_tensor_batch = {
+        "episode_id": np.array(
+            [row["episode"].episode_id for row in segment_rows], dtype=object
+        ),
+        "group_uid": np.array(
+            [row["episode"].group_uid for row in segment_rows], dtype=object
+        ),
+        "segment_id": np.array([row["segment_id"] for row in segment_rows]),
+        "source_batch_idx": np.array(
+            [row["episode"].source_batch_idx for row in segment_rows]
+        ),
+    }
+    if optimizer_step_by_source is not None:
+        non_tensor_batch["optimizer_step_id"] = np.array(
+            [row["optimizer_step_id"] for row in segment_rows], dtype=np.int64
+        )
+    segment_batch = DataProto.from_dict(
+        tensors=tensor_batch,
+        non_tensors=non_tensor_batch,
+        meta_info={
+            "compression_segment_training_stage": "7C-D1" if optimizer_step_by_source is not None else "7C-A",
+            "compression_prompt_carrier_width": prompt_carrier_width,
+            "compression_response_carrier_width": response_carrier_width,
+            "compression_max_prompt_length": max_prompt_length,
+            "compression_max_response_length": max_response_length,
+            "compression_padding_tokens_before": len(segment_rows)
+            * (max_prompt_length + max_response_length),
+            "compression_padding_tokens_carrier": len(segment_rows)
+            * (prompt_carrier_width + response_carrier_width),
+            **(
+                {
+                    "compression_segment_training": True,
+                    "effective_dp_degree": effective_dp_degree,
+                }
+                if optimizer_step_by_source is not None
+                else {}
+            ),
+        },
+    )
+
+    for episode in episodes:
+        episode_rows = np.where(
+            segment_batch.non_tensor_batch["episode_id"] == episode.episode_id
+        )[0]
+        total_weight = segment_batch.batch["episode_normalized_weight"][episode_rows].sum()
+        if not torch.isclose(total_weight, torch.tensor(1.0), rtol=1e-5, atol=1e-7):
+            raise ValueError(
+                f"Episode {episode.episode_id!r} normalized weight sums to "
+                f"{total_weight.item()} instead of 1"
+            )
+    if optimizer_step_by_source is not None:
+        for step_id in sorted(set(optimizer_step_by_source.values())):
+            source_indices = [
+                episode.source_batch_idx
+                for episode in episodes
+                if optimizer_step_by_source[episode.source_batch_idx] == step_id
+            ]
+            episode_count = len(source_indices)
+            step_rows = np.isin(
+                segment_batch.non_tensor_batch["source_batch_idx"], source_indices
+            )
+            dp_scale = float(effective_dp_degree or 1)
+            segment_batch.batch["actor_token_weight"][step_rows] *= dp_scale / episode_count
+            logical_weight = segment_batch.batch["actor_token_weight"][step_rows].sum()
+            if not torch.isclose(logical_weight, torch.tensor(dp_scale), rtol=1e-5, atol=1e-7):
+                raise ValueError(
+                    f"optimizer_step_id={step_id} logical actor weight sums to "
+                    f"{logical_weight.item()} instead of effective DP degree {dp_scale}"
+                )
+    return segment_batch
+
+
+def _transform_policy_segments_d2(
+    episodes: list[EpisodeRecord],
+    *,
+    optimizer_step_by_source: dict[int, int],
+    assignment: DistributedEpisodeAssignment,
+    effective_dp_degree: int,
+    sp_size: int,
+    eos_token_id: int,
+    max_prompt_length: int,
+    max_response_length: int,
+    pad_token_id: int,
+) -> DataProto:
+    """Add D2 assignment/dummies and create a physical-rank-major DataProto."""
+    real_batch = _transform_policy_segments(
+        episodes,
+        max_prompt_length=max_prompt_length,
+        max_response_length=max_response_length,
+        pad_token_id=pad_token_id,
+        optimizer_step_by_source=optimizer_step_by_source,
+        effective_dp_degree=effective_dp_degree,
+    )
+    real_sources = real_batch.non_tensor_batch["source_batch_idx"]
+    real_batch.non_tensor_batch["target_dp_replica"] = np.array(
+        [assignment.target_dp_by_source[int(source)] for source in real_sources],
+        dtype=np.int64,
+    )
+    real_batch.non_tensor_batch["is_dummy"] = np.zeros(len(real_batch), dtype=bool)
+    prompt_carrier_width = int(
+        real_batch.meta_info["compression_prompt_carrier_width"]
+    )
+    response_carrier_width = int(
+        real_batch.meta_info["compression_response_carrier_width"]
+    )
+
+    layout_rows = [
+        {
+            "optimizer_step_id": int(real_batch.non_tensor_batch["optimizer_step_id"][index]),
+            "target_dp_replica": int(real_batch.non_tensor_batch["target_dp_replica"][index]),
+            "data_index": index,
+            "is_dummy": False,
+        }
+        for index in range(len(real_batch))
+    ]
+    dummy_specs = []
+    step_ids = sorted(set(optimizer_step_by_source.values()))
+    for step_id in step_ids:
+        real_rows = [
+            sum(
+                row["optimizer_step_id"] == step_id
+                and row["target_dp_replica"] == dp
+                for row in layout_rows
+            )
+            for dp in range(effective_dp_degree)
+        ]
+        max_rows = max(real_rows)
+        target_rows = math.ceil(max_rows / sp_size) * sp_size
+        if target_rows == 0:
+            raise ValueError(f"optimizer_step_id={step_id} contains no real segment rows")
+        for dp, row_count in enumerate(real_rows):
+            for dummy_index in range(target_rows - row_count):
+                dummy_specs.append(
+                    _make_compression_dummy_segment(
+                        step_id=step_id,
+                        target_dp_replica=dp,
+                        dummy_index=dummy_index,
+                        eos_token_id=eos_token_id,
+                    )
+                )
+
+    if dummy_specs:
+        dummy_count = len(dummy_specs)
+        prompts = torch.full(
+            (dummy_count, prompt_carrier_width), pad_token_id, dtype=torch.long
+        )
+        responses = torch.full(
+            (dummy_count, response_carrier_width), pad_token_id, dtype=torch.long
+        )
+        prompts[:, -1] = eos_token_id
+        responses[:, 0] = eos_token_id
+        attention_mask = torch.zeros(
+            (dummy_count, prompt_carrier_width + response_carrier_width), dtype=torch.long
+        )
+        attention_mask[:, prompt_carrier_width - 1] = 1
+        attention_mask[:, prompt_carrier_width] = 1
+        zeros = torch.zeros((dummy_count, response_carrier_width), dtype=torch.float32)
+        dummy_batch = DataProto.from_dict(
+            tensors={
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": torch.cat([prompts, responses], dim=-1),
+                "attention_mask": attention_mask,
+                "position_ids": (
+                    torch.cumsum(attention_mask, dim=-1) - 1
+                ) * attention_mask,
+                "policy_mask": zeros.to(torch.long),
+                "advantages": zeros.clone(),
+                "episode_normalized_weight": zeros.clone(),
+                "actor_token_weight": zeros.clone(),
+            },
+            non_tensors={
+                "episode_id": np.array([spec["episode_id"] for spec in dummy_specs], dtype=object),
+                "group_uid": np.array([spec["group_uid"] for spec in dummy_specs], dtype=object),
+                "segment_id": np.full(dummy_count, -1, dtype=np.int64),
+                "source_batch_idx": np.full(dummy_count, -1, dtype=np.int64),
+                "optimizer_step_id": np.array([spec["optimizer_step_id"] for spec in dummy_specs], dtype=np.int64),
+                "target_dp_replica": np.array([spec["target_dp_replica"] for spec in dummy_specs], dtype=np.int64),
+                "is_dummy": np.ones(dummy_count, dtype=bool),
+            },
+            meta_info=real_batch.meta_info,
+        )
+        combined = DataProto.concat([real_batch, dummy_batch])
+    else:
+        combined = real_batch
+
+    layout_rows = [
+        {
+            "optimizer_step_id": int(combined.non_tensor_batch["optimizer_step_id"][index]),
+            "target_dp_replica": int(combined.non_tensor_batch["target_dp_replica"][index]),
+        }
+        for index in range(len(combined))
+    ]
+    physical_indices = _physical_rank_major_row_indices(
+        layout_rows,
+        effective_dp_degree=effective_dp_degree,
+        sp_size=sp_size,
+    )
+    combined = combined.select_idxs(physical_indices)
+    combined.meta_info.update(
+        {
+            "compression_segment_training_stage": "7C-D2",
+            "effective_dp_degree": effective_dp_degree,
+            "ulysses_sequence_parallel_size": sp_size,
+            "real_segment_rows": len(real_batch),
+            "dummy_rows": len(dummy_specs),
+            "dummy_tokens": len(dummy_specs) * 2,
+            "dp_costs_by_step": assignment.dp_costs_by_step,
+            "compression_padding_tokens_before": len(combined)
+            * (max_prompt_length + max_response_length),
+            "compression_padding_tokens_carrier": len(combined)
+            * (prompt_carrier_width + response_carrier_width),
+        }
+    )
+    return combined
+
+
 class AgentPPOTrainer(RayPPOTrainer):
     def __init__(
         self,
@@ -75,6 +831,234 @@ class AgentPPOTrainer(RayPPOTrainer):
             print("Using step-level advantage, max_prompt_length and max_response_length will be applied step-wise")
         else:
             print("Using trajectory-level advantage, max_prompt_length and max_response_length will be applied episode-wise")
+
+    def _query_compression_effective_dp_degree(self) -> int:
+        values = self.actor_rollout_wg.get_effective_data_parallel_size()
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        normalized = [int(value) for value in values]
+        if not normalized or len(set(normalized)) != 1:
+            raise RuntimeError(
+                f"FSDP workers disagree on effective data parallel degree: {normalized}"
+            )
+        return normalized[0]
+
+    def _validate_compression_d1_config(self, effective_dp_degree: int) -> int:
+        if effective_dp_degree != 1:
+            raise RuntimeError(
+                "Compression segment training stage 7C-D1 currently requires effective DP degree == 1"
+            )
+        if self.config.actor_rollout_ref.actor.use_dynamic_bsz:
+            raise RuntimeError(
+                "compression segment training stage 7C-D1 currently requires use_dynamic_bsz=False"
+            )
+        episode_mini_batch_size = self.config.agent.get(
+            "compression_episode_mini_batch_size", None
+        )
+        if not isinstance(episode_mini_batch_size, int) or isinstance(
+            episode_mini_batch_size, bool
+        ) or episode_mini_batch_size <= 0:
+            raise ValueError(
+                "agent.compression_episode_mini_batch_size must be an integer greater than 0"
+            )
+        if self.config.agent.use_stepwise_advantage:
+            raise ValueError("Context compression training requires trajectory-level advantage")
+        return episode_mini_batch_size
+
+    def _validate_compression_config(self, effective_dp_degree: int) -> int:
+        if effective_dp_degree <= 0:
+            raise RuntimeError("Compression training requires a positive effective DP degree")
+        if effective_dp_degree == 1:
+            return self._validate_compression_d1_config(effective_dp_degree)
+        if self.config.actor_rollout_ref.actor.use_dynamic_bsz:
+            raise RuntimeError(
+                "compression segment training currently requires use_dynamic_bsz=False"
+            )
+        episode_mini_batch_size = self.config.agent.get(
+            "compression_episode_mini_batch_size", None
+        )
+        if not isinstance(episode_mini_batch_size, int) or isinstance(
+            episode_mini_batch_size, bool
+        ) or episode_mini_batch_size <= 0:
+            raise ValueError(
+                "agent.compression_episode_mini_batch_size must be an integer greater than 0"
+            )
+        if self.config.agent.use_stepwise_advantage:
+            raise ValueError("Context compression training requires trajectory-level advantage")
+        return episode_mini_batch_size
+
+    def _run_compression_training_step(
+        self,
+        *,
+        batch: DataProto,
+        timing_raw: dict[str, Any],
+        effective_dp_degree: int,
+        episode_mini_batch_size: int,
+    ) -> tuple[DataProto | None, dict[str, Any]]:
+        raw_result = self.generate_agent_trajectory(
+            timing_raw=timing_raw,
+            meta_info=batch.meta_info,
+            return_raw_trajectories=True,
+        )
+        metrics = dict(raw_result.metrics)
+        build_result = _build_episode_records(
+            raw_result.trajectories, batch.non_tensor_batch["uid"]
+        )
+        metrics["compression/dropped_groups"] = len(build_result.dropped_group_uids)
+        if build_result.skip_batch:
+            return None, metrics
+
+        episodes = build_result.episodes
+        rewards = torch.tensor([episode.reward for episode in episodes], dtype=torch.float32).unsqueeze(-1)
+        selection = _compute_rejection_sampling_selection(
+            np.array([episode.group_uid for episode in episodes], dtype=object), rewards
+        )
+        metrics.update(
+            {
+                "batch/solve_none": selection.solve_none,
+                "batch/solve_all": selection.solve_all,
+                "batch/solve_partial": selection.solve_partial,
+            }
+        )
+        if self.config.trainer.rejection_sample:
+            episodes = [
+                episode
+                for episode, keep in zip(episodes, selection.valid_mask.tolist())
+                if keep
+            ]
+            if not episodes:
+                return None, metrics
+
+        episode_batch = _build_episode_advantage_batch(episodes, self.tokenizer.pad_token_id)
+        episode_batch = compute_advantage(
+            episode_batch,
+            adv_estimator=self.config.algorithm.adv_estimator,
+            gamma=self.config.algorithm.gamma,
+            lam=self.config.algorithm.lam,
+            mask_truncated_samples=self.config.algorithm.mask_truncated_samples,
+            clip_advantages=self.config.algorithm.clip_advantages,
+        )
+        response_mask = compute_response_mask(episode_batch)
+        _extract_episode_scalar_advantages(
+            episodes,
+            episode_batch.batch["advantages"],
+            response_mask,
+            episode_batch.non_tensor_batch["source_batch_idx"],
+        )
+
+        buckets = _pack_episode_optimizer_steps(episodes, episode_mini_batch_size)
+        optimizer_step_by_source = {
+            episode.source_batch_idx: step_id
+            for step_id, bucket in enumerate(buckets)
+            for episode in bucket
+        }
+        assignment = None
+        if effective_dp_degree == 1:
+            segment_batch = _transform_policy_segments(
+                episodes,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                optimizer_step_by_source=optimizer_step_by_source,
+                effective_dp_degree=effective_dp_degree,
+            )
+        else:
+            assignment = _assign_episode_buckets_to_dp(
+                buckets, effective_dp_degree
+            )
+            segment_batch = _transform_policy_segments_d2(
+                episodes,
+                optimizer_step_by_source=optimizer_step_by_source,
+                assignment=assignment,
+                effective_dp_degree=effective_dp_degree,
+                sp_size=self.config.actor_rollout_ref.actor.ulysses_sequence_parallel_size,
+                eos_token_id=self.tokenizer.eos_token_id,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        segment_batch.meta_info.update(
+            {
+                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "multi_turn": False,
+                "global_token_num": torch.sum(
+                    segment_batch.batch["attention_mask"], dim=-1
+                ).tolist(),
+            }
+        )
+
+        # Freeze all behavior-policy/reference log probabilities before the first update.
+        with _timer("old_log_prob", timing_raw):
+            if effective_dp_degree == 1:
+                old_log_prob = _select_unique_sp_result(
+                    self.actor_rollout_wg.compute_compression_log_prob_d1(segment_batch),
+                    operation="compute_compression_log_prob_d1",
+                )
+            else:
+                old_log_prob = self.actor_rollout_wg.compute_compression_log_prob_d2(
+                    segment_batch
+                )
+            segment_batch = segment_batch.union(old_log_prob)
+        if self.use_reference_policy:
+            with _timer("ref", timing_raw):
+                if effective_dp_degree == 1:
+                    ref_log_prob = _select_unique_sp_result(
+                        self.ref_policy_wg.compute_compression_ref_log_prob_d1(segment_batch),
+                        operation="compute_compression_ref_log_prob_d1",
+                    )
+                else:
+                    ref_log_prob = self.ref_policy_wg.compute_compression_ref_log_prob_d2(
+                        segment_batch
+                    )
+                segment_batch = segment_batch.union(ref_log_prob)
+
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            with _timer("update_actor", timing_raw):
+                if effective_dp_degree == 1:
+                    actor_results = self.actor_rollout_wg.update_compression_actor_d1(
+                        segment_batch
+                    )
+                    actor_output = _select_unique_sp_result(
+                        actor_results, operation="update_compression_actor_d1"
+                    )
+                else:
+                    actor_output = self.actor_rollout_wg.update_compression_actor_d2(
+                        segment_batch
+                    )
+            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+
+        episode_counts = [len(bucket) for bucket in buckets]
+        metrics.update(
+            {
+                "compression/optimizer_steps": len(buckets) * self.config.actor_rollout_ref.actor.ppo_epochs,
+                "compression/episodes_per_step_min": min(episode_counts),
+                "compression/episodes_per_step_max": max(episode_counts),
+                "compression/episodes_per_step_mean": float(np.mean(episode_counts)),
+                "compression/episodes": len(episodes),
+                "compression/segments": sum(len(episode.policy_segments) for episode in episodes),
+                "compression/policy_tokens": int(segment_batch.batch["policy_mask"].sum().item()),
+                "compression/effective_dp_degree": effective_dp_degree,
+                "compression/logical_segment_rows": len(segment_batch),
+                "compression/real_segment_rows": int(segment_batch.meta_info.get("real_segment_rows", len(segment_batch))),
+                "compression/dummy_rows": int(segment_batch.meta_info.get("dummy_rows", 0)),
+                "compression/dummy_tokens": int(segment_batch.meta_info.get("dummy_tokens", 0)),
+                "compression/physical_rows_with_dummy": len(segment_batch),
+            }
+        )
+        if assignment is not None:
+            all_dp_costs = [
+                cost
+                for costs in assignment.dp_costs_by_step.values()
+                for cost in costs
+            ]
+            metrics.update(
+                {
+                    "compression/max_dp_cost": max(all_dp_costs),
+                    "compression/min_dp_cost": min(all_dp_costs),
+                    "compression/dp_cost_imbalance": max(all_dp_costs) - min(all_dp_costs),
+                }
+            )
+        return segment_batch, metrics
 
     def init_workers(self):
         super().init_workers()
@@ -166,6 +1150,21 @@ class AgentPPOTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        compression_enabled = bool(
+            self.agent_args.get("enable_context_compression", False)
+        )
+        compression_effective_dp_degree = None
+        compression_episode_mini_batch_size = None
+        if compression_enabled:
+            compression_effective_dp_degree = (
+                self._query_compression_effective_dp_degree()
+            )
+            compression_episode_mini_batch_size = (
+                self._validate_compression_config(
+                    compression_effective_dp_degree
+                )
+            )
+
         # perform validation before training
         import time
 
@@ -199,6 +1198,52 @@ class AgentPPOTrainer(RayPPOTrainer):
                 batch.meta_info = {
                     "agent_rollout": True,  # no need to generate multiple ones since environment is repeated already
                 }
+
+                if compression_enabled:
+                    with _timer("step", timing_raw):
+                        pprint(
+                            f"!!!!!!!!step {self.global_steps} compression D{compression_effective_dp_degree}: initializing envs and agents"
+                        )
+                        self.init_envs_and_agents(batch)
+                        compression_batch, compression_metrics = (
+                            self._run_compression_training_step(
+                                batch=batch,
+                                timing_raw=timing_raw,
+                                effective_dp_degree=compression_effective_dp_degree,
+                                episode_mini_batch_size=compression_episode_mini_batch_size,
+                            )
+                        )
+                        metrics.update(compression_metrics)
+                        if compression_batch is None:
+                            continue
+
+                        if (
+                            self.val_reward_fn is not None
+                            and self.config.trainer.test_freq > 0
+                            and self.global_steps % self.config.trainer.test_freq == 0
+                        ):
+                            with _timer("testing", timing_raw):
+                                metrics.update(self._validate_agent())
+                        if (
+                            self.config.trainer.save_freq > 0
+                            and self.global_steps % self.config.trainer.save_freq == 0
+                        ):
+                            with _timer("save_checkpoint", timing_raw):
+                                self._save_checkpoint()
+
+                    metrics.update(
+                        compute_timing_metrics(
+                            batch=compression_batch, timing_raw=timing_raw
+                        )
+                    )
+                    logger.log(data=metrics, step=self.global_steps)
+                    self.global_steps += 1
+                    if self.global_steps >= self.total_training_steps:
+                        if self.val_reward_fn is not None:
+                            val_metrics = self._validate_agent()
+                            logger.log(data=val_metrics, step=self.global_steps)
+                        return
+                    continue
 
                 with _timer("step", timing_raw):
                     pprint(f"!!!!!!!!step {self.global_steps} started, now initializing envs and agents")
@@ -532,7 +1577,9 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         return metric_dict
 
-    def generate_agent_trajectory(self, timing_raw=None, meta_info=None):
+    def generate_agent_trajectory(
+        self, timing_raw=None, meta_info=None, return_raw_trajectories=False
+    ):
         """
         Generates agent trajectories by interacting with the environment. Does not close or reset the environment afterwards
 
@@ -563,6 +1610,12 @@ class AgentPPOTrainer(RayPPOTrainer):
         with _timer("transform_trajectory", timing_raw):
             # Transform the raw trajectories into DataProto format.
             final_gen_batch_output, metrics = self._transform_agent_trajectories(trajectories)
+        if return_raw_trajectories:
+            return AgentTrajectoryGenerationResult(
+                trajectories=trajectories,
+                transformed=final_gen_batch_output,
+                metrics=metrics,
+            )
         return final_gen_batch_output, metrics
 
     def generate_agent_steps(self, timing_raw=None, meta_info=None, uids=None):
@@ -675,6 +1728,9 @@ class AgentPPOTrainer(RayPPOTrainer):
                             "prompt_token_count": int(trajectories[idx_write]["prompt_tokens"].numel()),
                             "traj_score":float(traj_scores[idx_write]),
                             "traj_metric":traj_metrics_ori[idx_write],
+                            "pre_training_rollout": bool(self.global_steps == 1),
+                            "compression_events": trajectories[idx_write].get("compression_events", []),
+                            "forced_compression_candidates": trajectories[idx_write].get("forced_compression_candidates", []),
                             # "global_step":int(self.global_steps),
                             "termination_reason":termination_reasons[idx_write],
                             # "timeout_info":timeout_infos[idx_write]

@@ -22,6 +22,7 @@ import warnings
 from dataclasses import asdict
 from typing import Union
 
+import numpy as np
 import psutil
 import torch
 import torch.distributed
@@ -161,6 +162,29 @@ class ActorRolloutRefWorker(Worker):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_effective_data_parallel_size(self):
+        """Return the authoritative logical DP degree represented by this worker mesh."""
+        if self.ulysses_device_mesh is not None:
+            return self.ulysses_device_mesh["dp"].size()
+        return self.device_mesh.size()
+
+    def _validate_compression_d2_rows(self, data: DataProto, *, after_sp_gather: bool):
+        if data.meta_info.get("compression_segment_training_stage") != "7C-D2":
+            return
+        if self.ulysses_device_mesh is None:
+            raise RuntimeError("Compression D2 requires an Ulysses DP/SP mesh")
+        if "target_dp_replica" not in data.non_tensor_batch:
+            raise ValueError("Compression D2 batch is missing target_dp_replica")
+        current_dp = self.ulysses_device_mesh["dp"].get_local_rank()
+        targets = data.non_tensor_batch["target_dp_replica"]
+        if len(targets) == 0 or not np.all(targets == current_dp):
+            stage = "after SP gather" if after_sp_gather else "before SP gather"
+            raise ValueError(
+                f"Compression D2 row routing mismatch {stage}: "
+                f"worker_dp={current_dp}, targets={np.unique(targets).tolist()}"
+            )
 
     def _build_model_optimizer(
         self,
@@ -577,7 +601,9 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
 
         with self.ulysses_sharding_manager:
+            self._validate_compression_d2_rows(data, after_sp_gather=False)
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            self._validate_compression_d2_rows(data, after_sp_gather=True)
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
@@ -657,7 +683,9 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
+            self._validate_compression_d2_rows(data, after_sp_gather=False)
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            self._validate_compression_d2_rows(data, after_sp_gather=True)
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(
@@ -700,7 +728,9 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
+            self._validate_compression_d2_rows(data, after_sp_gather=False)
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            self._validate_compression_d2_rows(data, after_sp_gather=True)
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
@@ -712,6 +742,138 @@ class ActorRolloutRefWorker(Worker):
         if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
             self.ref_policy.actor_module._handle.reshard(True)
 
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_compression_log_prob_d2(self, data: DataProto):
+        if data.meta_info.get("effective_dp_degree", 1) <= 1:
+            raise RuntimeError("Compression D2 logprob requires effective DP degree > 1")
+        if data.meta_info.get("compression_segment_training_stage") != "7C-D2":
+            raise RuntimeError("Compression D2 logprob received a non-D2 batch")
+        return self.compute_log_prob(data)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_compression_ref_log_prob_d2(self, data: DataProto):
+        if data.meta_info.get("effective_dp_degree", 1) <= 1:
+            raise RuntimeError("Compression D2 ref logprob requires effective DP degree > 1")
+        if data.meta_info.get("compression_segment_training_stage") != "7C-D2":
+            raise RuntimeError("Compression D2 ref logprob received a non-D2 batch")
+        return self.compute_ref_log_prob(data)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def update_compression_actor_d2(self, data: DataProto):
+        if data.meta_info.get("effective_dp_degree", 1) <= 1:
+            raise RuntimeError("Compression D2 actor update requires effective DP degree > 1")
+        if data.meta_info.get("compression_segment_training_stage") != "7C-D2":
+            raise RuntimeError("Compression D2 actor update received a non-D2 batch")
+        return self.update_actor(data)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_compression_log_prob_d1(self, data: DataProto):
+        """Compute one logical D1 batch across an SP group without row all-gather."""
+        assert self._is_actor
+        if data.meta_info.get("effective_dp_degree") != 1:
+            raise RuntimeError("Compression D1 logprob received a non-D1 logical batch")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(get_torch_device().current_device())
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        with self.ulysses_sharding_manager:
+            # ONE_TO_ALL already gives every physical SP rank the same logical rows.
+            # _forward_micro_batch performs the sequence slice/gather; an outer
+            # preprocess_data() here would incorrectly expand S rows to S * SP.
+            log_probs, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        output = DataProto.from_dict(
+            tensors={"old_log_probs": log_probs, "entropys": entropys},
+            meta_info={"temperature": self.config.rollout.temperature},
+        ).to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_compression_ref_log_prob_d1(self, data: DataProto):
+        """Reference logprob counterpart of compute_compression_log_prob_d1."""
+        if data.meta_info.get("effective_dp_degree") != 1:
+            raise RuntimeError("Compression D1 ref logprob received a non-D1 logical batch")
+        data = data.to(get_torch_device().current_device())
+        with self.ulysses_sharding_manager:
+            if self._is_lora:
+                from contextlib import nullcontext
+
+                adapter_ctx = (
+                    self.actor.actor_module.disable_adapter()
+                    if self._is_actor
+                    else nullcontext()
+                )
+                data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+                data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+                data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+                data.meta_info["temperature"] = self.config.rollout.temperature
+                with adapter_ctx:
+                    log_probs, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+            else:
+                assert self._is_ref
+                if self._is_offload_param:
+                    load_fsdp_model_to_gpu(self.ref_module_fsdp)
+                data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+                data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+                data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+                data.meta_info["temperature"] = self.config.rollout.temperature
+                log_probs, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        output = DataProto.from_dict(tensors={"ref_log_prob": log_probs}).to("cpu")
+        module = self.actor.actor_module if self._is_lora else self.ref_policy.actor_module
+        if self.world_size > 1 and fsdp_version(module) == 1:
+            module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(
+                self.actor_module_fsdp if self._is_lora else self.ref_module_fsdp
+            )
+        return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_compression_actor_d1(self, data: DataProto):
+        """Run all logical optimizer buckets once across the single DP/SP group."""
+        assert self._is_actor
+        if data.meta_info.get("effective_dp_degree") != 1:
+            raise RuntimeError("Compression D1 actor update received a non-D1 logical batch")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(
+                optimizer=self.actor_optimizer,
+                device_id=get_torch_device().current_device(),
+            )
+        data = data.to(get_torch_device().current_device())
+        with self.ulysses_sharding_manager:
+            with Timer(name="update_compression_policy_d1", logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(
+                global_num_tokens, delta_time
+            )
+            metrics["perf/mfu/actor"] = (
+                estimated_flops
+                * self.config.actor.ppo_epochs
+                / promised_flops
+                / self.world_size
+            )
+            metrics["actor/lr"] = self.actor_lr_scheduler.get_last_lr()[0]
+            self.actor_lr_scheduler.step()
+            output = DataProto(meta_info={"metrics": metrics}).to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

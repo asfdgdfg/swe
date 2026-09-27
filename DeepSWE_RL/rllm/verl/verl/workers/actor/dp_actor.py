@@ -22,13 +22,19 @@ import logging
 import os
 from typing import Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_policy_loss,
+    compute_policy_loss_weighted,
+    kl_penalty,
+)
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -48,6 +54,131 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+_COMPRESSION_RESPONSE_ALIGNED_FIELDS = (
+    "responses",
+    "advantages",
+    "policy_mask",
+    "episode_normalized_weight",
+    "actor_token_weight",
+    "old_log_probs",
+    "ref_log_prob",
+)
+
+
+def _trim_compression_microbatch(micro_batch, prompt_carrier_width, response_carrier_width):
+    """Trim one rectangular compression carrier to its local P/R widths.
+
+    Attention, rather than policy_mask, defines real response tokens because
+    tool observations are conditioning tokens with policy_mask == 0.
+    """
+    values = {key: micro_batch[key] for key in micro_batch.keys()}
+    attention_mask = values["attention_mask"]
+    if attention_mask.dim() != 2:
+        raise ValueError("Compression minimal padding requires a 2-D attention_mask")
+    expected_width = prompt_carrier_width + response_carrier_width
+    if attention_mask.size(1) != expected_width:
+        raise ValueError(
+            "Compression carrier width mismatch: "
+            f"attention_width={attention_mask.size(1)}, expected={expected_width}"
+        )
+
+    prompt_attention = attention_mask[:, :prompt_carrier_width]
+    response_attention = attention_mask[
+        :, prompt_carrier_width : prompt_carrier_width + response_carrier_width
+    ]
+    prompt_lengths = prompt_attention.sum(dim=-1).to(torch.long)
+    response_lengths = response_attention.sum(dim=-1).to(torch.long)
+    if torch.any(prompt_lengths <= 0) or torch.any(response_lengths <= 0):
+        raise ValueError("Compression segment rows must contain prompt and response tokens")
+
+    prompt_columns = torch.arange(
+        prompt_carrier_width, device=attention_mask.device
+    ).unsqueeze(0)
+    expected_prompt = prompt_columns >= (
+        prompt_carrier_width - prompt_lengths
+    ).unsqueeze(1)
+    response_columns = torch.arange(
+        response_carrier_width, device=attention_mask.device
+    ).unsqueeze(0)
+    expected_response = response_columns < response_lengths.unsqueeze(1)
+    if not torch.equal(prompt_attention.bool(), expected_prompt):
+        raise ValueError(
+            "Compression prompt attention mask must be contiguous left padding: 0...0 1...1"
+        )
+    if not torch.equal(response_attention.bool(), expected_response):
+        raise ValueError(
+            "Compression response attention mask must be contiguous right padding: 1...1 0...0"
+        )
+
+    prompt_local_width = int(prompt_lengths.max().item())
+    response_local_width = int(response_lengths.max().item())
+    prompt_start = prompt_carrier_width - prompt_local_width
+    prompt_slice = slice(prompt_start, prompt_carrier_width)
+    response_input_slice = slice(
+        prompt_carrier_width, prompt_carrier_width + response_local_width
+    )
+
+    for key in ("input_ids", "attention_mask", "position_ids"):
+        if key not in values:
+            continue
+        tensor = values[key]
+        if tensor.dim() != 2:
+            raise ValueError(
+                f"Compression minimal padding requires 2-D {key}, got {tensor.dim()} dimensions"
+            )
+        values[key] = torch.cat(
+            [tensor[:, prompt_slice], tensor[:, response_input_slice]], dim=-1
+        )
+    if "prompts" in values:
+        values["prompts"] = values["prompts"][:, prompt_slice]
+    for key in _COMPRESSION_RESPONSE_ALIGNED_FIELDS:
+        if key in values:
+            if values[key].size(-1) != response_carrier_width:
+                raise ValueError(
+                    f"Compression response-aligned field {key!r} has width "
+                    f"{values[key].size(-1)}, expected {response_carrier_width}"
+                )
+            values[key] = values[key][:, :response_local_width]
+
+    total_nnz = int(values["attention_mask"].sum().item())
+    return values, {
+        "prompt_local_width": prompt_local_width,
+        "response_local_width": response_local_width,
+        "total_local_width": prompt_local_width + response_local_width,
+        "total_nnz": total_nnz,
+        "local_capacity": len(attention_mask)
+        * (prompt_local_width + response_local_width),
+    }
+
+
+def _restore_compression_response_width(tensor, response_carrier_width):
+    """Right-pad a local logprob/entropy result back to the carrier API."""
+    local_width = tensor.size(-1)
+    if local_width > response_carrier_width:
+        raise ValueError(
+            f"Compression local response width {local_width} exceeds carrier width "
+            f"{response_carrier_width}"
+        )
+    if local_width == response_carrier_width:
+        return tensor
+    return torch.nn.functional.pad(
+        tensor, (0, response_carrier_width - local_width), value=0.0
+    )
+
+
+def _compression_carrier_widths(data):
+    """Read real carrier metadata, with a centralized legacy-test fallback."""
+    response_width = data.meta_info.get("compression_response_carrier_width")
+    prompt_width = data.meta_info.get("compression_prompt_carrier_width")
+    if response_width is None:
+        response_width = data.batch["responses"].size(-1)
+    if prompt_width is None:
+        prompt_width = data.batch["input_ids"].size(-1) - int(response_width)
+    if int(prompt_width) <= 0 or int(response_width) <= 0:
+        raise ValueError("Compression carrier widths must both be positive")
+    return int(prompt_width), int(response_width)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -275,6 +406,21 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        compression_segment_training = data.meta_info.get(
+            "compression_segment_training", False
+        )
+        prompt_carrier_width = response_carrier_width = None
+        if compression_segment_training:
+            prompt_carrier_width, response_carrier_width = (
+                _compression_carrier_widths(data)
+            )
+            if getattr(self, "use_ulysses_sp", False) and not getattr(
+                self, "use_remove_padding", False
+            ):
+                raise RuntimeError(
+                    "compression minimal padding with Ulysses SP currently requires "
+                    "use_remove_padding=True"
+                )
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         batch = data.select(batch_keys=select_keys).batch
@@ -296,8 +442,22 @@ class DataParallelPPOActor(BasePPOActor):
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            if compression_segment_training:
+                micro_batch, _ = _trim_compression_microbatch(
+                    micro_batch,
+                    int(prompt_carrier_width),
+                    int(response_carrier_width),
+                )
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+            if compression_segment_training:
+                log_probs = _restore_compression_response_width(
+                    log_probs, int(response_carrier_width)
+                )
+                if calculate_entropy:
+                    entropy = _restore_compression_response_width(
+                        entropy, int(response_carrier_width)
+                    )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -321,9 +481,42 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+        compression_segment_training = data.meta_info.get(
+            "compression_segment_training", False
+        )
+        prompt_carrier_width = response_carrier_width = None
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
-        if multi_turn:
+        if compression_segment_training:
+            prompt_carrier_width, response_carrier_width = (
+                _compression_carrier_widths(data)
+            )
+            if getattr(self, "use_ulysses_sp", False) and not getattr(
+                self, "use_remove_padding", False
+            ):
+                raise RuntimeError(
+                    "compression minimal padding with Ulysses SP currently requires "
+                    "use_remove_padding=True"
+                )
+            required_fields = set(select_keys + ["policy_mask", "actor_token_weight"])
+            if self.config.use_kl_loss:
+                required_fields.add("ref_log_prob")
+            missing_fields = sorted(required_fields - set(data.batch.keys()))
+            if missing_fields:
+                raise ValueError(
+                    "Compression segment training batch is missing required fields: "
+                    f"{missing_fields}"
+                )
+            select_keys.extend(["policy_mask", "actor_token_weight"])
+            if self.config.use_dynamic_bsz:
+                raise RuntimeError(
+                    "compression segment training stage 7C-D1 currently requires use_dynamic_bsz=False"
+                )
+            if "optimizer_step_id" not in data.non_tensor_batch:
+                raise ValueError(
+                    "Compression segment training batch is missing optimizer_step_id"
+                )
+        elif multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -332,7 +525,20 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        if has_multi_modal_inputs:
+        if compression_segment_training:
+            optimizer_step_ids = data.non_tensor_batch["optimizer_step_id"]
+            unique_step_ids = sorted({int(value) for value in optimizer_step_ids})
+            if unique_step_ids != list(range(len(unique_step_ids))):
+                raise ValueError(
+                    "Compression optimizer_step_id values must be contiguous from zero"
+                )
+            dataloader = [
+                batch[np.where(optimizer_step_ids == step_id)[0]]
+                for step_id in unique_step_ids
+            ]
+            if any(len(step_batch) == 0 for step_batch in dataloader):
+                raise ValueError("Compression optimizer step cannot be empty")
+        elif has_multi_modal_inputs:
             num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
@@ -340,6 +546,23 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        compression_padding_stats = {
+            "local_capacity": 0,
+            "sp_padding": 0,
+            "max_prompt": 0,
+            "max_response": 0,
+            "max_total": 0,
+        }
+        if compression_segment_training:
+            real_tokens = int(batch["attention_mask"].sum().item())
+            row_count = len(batch)
+            hard_capacity = row_count * (
+                int(data.meta_info.get("compression_max_prompt_length", prompt_carrier_width))
+                + int(data.meta_info.get("compression_max_response_length", response_carrier_width))
+            )
+            carrier_capacity = row_count * (
+                int(prompt_carrier_width) + int(response_carrier_width)
+            )
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -357,6 +580,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                weighted_step_metrics = {}
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -364,10 +588,39 @@ class DataParallelPPOActor(BasePPOActor):
                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
                     else:
                         data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
+                    if compression_segment_training:
+                        data, trim_stats = _trim_compression_microbatch(
+                            data,
+                            int(prompt_carrier_width),
+                            int(response_carrier_width),
+                        )
+                        if epoch == 0:
+                            compression_padding_stats["local_capacity"] += trim_stats[
+                                "local_capacity"
+                            ]
+                            compression_padding_stats["sp_padding"] += (
+                                self.ulysses_sequence_parallel_size
+                                - trim_stats["total_nnz"]
+                                % self.ulysses_sequence_parallel_size
+                            ) % self.ulysses_sequence_parallel_size
+                            compression_padding_stats["max_prompt"] = max(
+                                compression_padding_stats["max_prompt"],
+                                trim_stats["prompt_local_width"],
+                            )
+                            compression_padding_stats["max_response"] = max(
+                                compression_padding_stats["max_response"],
+                                trim_stats["response_local_width"],
+                            )
+                            compression_padding_stats["max_total"] = max(
+                                compression_padding_stats["max_total"],
+                                trim_stats["total_local_width"],
+                            )
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
-                    if multi_turn:
+                    if compression_segment_training:
+                        response_mask = data["policy_mask"]
+                    elif multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
@@ -388,20 +641,39 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
+                    if compression_segment_training:
+                        actor_token_weight = data["actor_token_weight"]
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = (
+                            compute_policy_loss_weighted(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                policy_mask=response_mask,
+                                actor_token_weight=actor_token_weight,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                            )
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        if compression_segment_training:
+                            entropy_loss = torch.sum(entropy * actor_token_weight)
+                        else:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -412,29 +684,85 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        if compression_segment_training:
+                            kl_loss = torch.sum(kld * actor_token_weight)
+                        else:
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        if not compression_segment_training:
+                            metrics["actor/kl_loss"] = kl_loss.detach().item()
+                            metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
+                    if compression_segment_training:
+                        # actor_token_weight already carries the complete optimizer-step
+                        # normalization. Microbatch gradients must add without rescaling.
+                        loss = policy_loss
+                    elif self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
-                    data = {
+                    micro_metrics = {
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
-                    append_to_dict(metrics, data)
+                    if compression_segment_training:
+                        if entropy_coeff != 0:
+                            micro_metrics["actor/entropy_loss"] = entropy_loss.detach().item()
+                        if self.config.use_kl_loss:
+                            micro_metrics["actor/kl_loss"] = kl_loss.detach().item()
+                        for key, value in micro_metrics.items():
+                            weighted_step_metrics[key] = weighted_step_metrics.get(key, 0.0) + value
+                    else:
+                        append_to_dict(metrics, micro_metrics)
+
+                if compression_segment_training:
+                    if self.config.use_kl_loss:
+                        weighted_step_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                    append_to_dict(metrics, weighted_step_metrics)
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
+        if compression_segment_training:
+            local_capacity = compression_padding_stats["local_capacity"]
+            append_to_dict(
+                metrics,
+                {
+                    "compression/padding_tokens_before": hard_capacity,
+                    "compression/padding_tokens_after": local_capacity,
+                    "compression/padding_tokens_saved": hard_capacity
+                    - local_capacity,
+                    "compression/padding_ratio_before": (
+                        (hard_capacity - real_tokens) / hard_capacity
+                        if hard_capacity
+                        else 0.0
+                    ),
+                    "compression/padding_ratio_after": (
+                        (local_capacity - real_tokens) / local_capacity
+                        if local_capacity
+                        else 0.0
+                    ),
+                    "compression/batch_padding_tokens": carrier_capacity
+                    - real_tokens,
+                    "compression/sp_divisibility_padding_tokens": compression_padding_stats[
+                        "sp_padding"
+                    ],
+                    "compression/max_microbatch_prompt_len": compression_padding_stats[
+                        "max_prompt"
+                    ],
+                    "compression/max_microbatch_response_len": compression_padding_stats[
+                        "max_response"
+                    ],
+                    "compression/max_microbatch_total_len": compression_padding_stats[
+                        "max_total"
+                    ],
+                },
+            )
         self.actor_optimizer.zero_grad()
         return metrics

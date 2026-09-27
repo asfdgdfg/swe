@@ -516,6 +516,109 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_policy_loss_weighted(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    policy_mask: torch.Tensor,
+    actor_token_weight: torch.Tensor,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+):
+    """Compute token-level PPO loss using caller-provided optimizer-step weights.
+
+    This is the compression-segment counterpart of :func:`compute_policy_loss`.
+    It deliberately duplicates the baseline token-level clipping formula and
+    changes only the final aggregation. ``actor_token_weight`` is treated as a
+    final weight: this function never derives or renormalizes it.
+    """
+    tensors = {
+        "old_log_prob": old_log_prob,
+        "log_prob": log_prob,
+        "advantages": advantages,
+        "policy_mask": policy_mask,
+        "actor_token_weight": actor_token_weight,
+    }
+    expected_shape = old_log_prob.shape
+    mismatched = {
+        name: tuple(tensor.shape)
+        for name, tensor in tensors.items()
+        if tensor.shape != expected_shape
+    }
+    if mismatched:
+        raise ValueError(
+            f"Weighted PPO tensor shapes must all equal {tuple(expected_shape)}; "
+            f"mismatched={mismatched}"
+        )
+    if not torch.isfinite(actor_token_weight).all():
+        raise ValueError("actor_token_weight must contain only finite values")
+    if torch.any(actor_token_weight < 0):
+        raise ValueError("actor_token_weight must be non-negative")
+    if not torch.all((policy_mask == 0) | (policy_mask == 1)):
+        raise ValueError("policy_mask must contain only 0/1 values")
+    if torch.any(actor_token_weight[policy_mask == 0] != 0):
+        raise ValueError("actor_token_weight must be zero where policy_mask is zero")
+    if torch.any((actor_token_weight > 0) & (policy_mask != 1)):
+        raise ValueError("positive actor_token_weight requires policy_mask == 1")
+
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        f" but get the value: {clip_ratio_c}."
+    )
+
+    # Keep this token-level formula aligned with compute_policy_loss above for
+    # every active token.  Inactive carrier padding must be neutralized before
+    # exp: multiplying an overflowed ratio by a zero weight afterwards would
+    # otherwise produce inf * 0 == NaN.
+    active_weight_mask = actor_token_weight > 0
+    negative_approx_kl = log_prob - old_log_prob
+    safe_negative_approx_kl = torch.where(
+        active_weight_mask,
+        negative_approx_kl,
+        torch.zeros_like(negative_approx_kl),
+    )
+    safe_advantages = torch.where(
+        active_weight_mask, advantages, torch.zeros_like(advantages)
+    )
+    ratio = torch.exp(safe_negative_approx_kl)
+    ppo_kl_tokens = -safe_negative_approx_kl
+
+    pg_losses1 = -safe_advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -safe_advantages * torch.clamp(
+        ratio, 1 - cliprange_low, 1 + cliprange_high
+    )
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    clipfrac_tokens = torch.gt(pg_losses2, pg_losses1).float()
+
+    pg_losses3 = -safe_advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    lower_clipfrac_tokens = (
+        torch.gt(clip_pg_losses1, pg_losses3) * (safe_advantages < 0).float()
+    )
+    pg_losses = torch.where(
+        safe_advantages < 0, clip_pg_losses2, clip_pg_losses1
+    )
+
+    weighted_pg_loss = torch.sum(pg_losses * actor_token_weight)
+    weighted_clipfrac = torch.sum(clipfrac_tokens * actor_token_weight)
+    weighted_ppo_kl = torch.sum(ppo_kl_tokens * actor_token_weight)
+    weighted_lower_clipfrac = torch.sum(
+        lower_clipfrac_tokens * actor_token_weight
+    )
+    return (
+        weighted_pg_loss,
+        weighted_clipfrac,
+        weighted_ppo_kl,
+        weighted_lower_clipfrac,
+    )
+
+
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
     """Compute categorical entropy loss (For backward compatibility)
 

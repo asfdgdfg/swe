@@ -300,7 +300,17 @@ agent:
   trajectory_timeout: null
   overlong_filter: False
   normalize_step_advantage: False
+  # Global number of real episodes per optimizer step for context-compression training.
+  # Required and strictly positive when agent_args.enable_context_compression=true.
+  compression_episode_mini_batch_size: null
   use_stepwise_advantage: False
   stepwise_advantage_mode: "broadcast" 
+  # SWE launchers may set the following keys inside agent_args:
+  # context_compression_mode: autonomous | hybrid | forced
+  # compression_warning_tokens: 32768
+  # compression_force_tokens: 40960
+  # compression_summary_max_tokens: 1024
+  # compression_retry_num: 2
+  # compression_force_min_response_budget: 2048
   agent_args: {}
   engine_args: {}

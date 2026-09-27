@@ -409,6 +409,10 @@ class ActorRolloutRefWorker(MegatronWorker):
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     @GPUMemoryLogger(role="update_actor", logger=logger)
     def update_actor(self, data: DataProto):
+        if data.meta_info.get("compression_segment_training", False):
+            raise NotImplementedError(
+                "compression segment training currently supports FSDP only"
+            )
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
